@@ -1,170 +1,127 @@
-# Imports
 import discord
 from discord.ext import commands
+import os
+import aiosqlite
+from dotenv import load_dotenv
 
-# Create Bot
-bot = discord.Bot(intents=discord.Intents.all())
+load_dotenv()
+TOKEN = os.getenv('DISCORD_BOT_TOKEN') # Ensure to set this properly in your environment
+intents = discord.Intents.default()
+intents.members = True
+bot = commands.Bot(command_prefix='/', intents=intents)
 
-# Setup List
-invites = {}
-referralamounts = {}
+invites_before = {}
 
-# Create Invites
-@bot.command(description="Creates an invite for you.")
-async def createinvite(ctx):
-    author_id = str(ctx.author.id)
-    if author_id in invites:
-        await ctx.respond(f"You already have an invite: {invites[author_id]['url']} with {invites[author_id]['uses']} uses.")
-        return
-    invite = await ctx.channel.create_invite(max_uses=0)
-    invites[author_id] = {"url": invite.url, "uses": 0, "users": []}
-    update_invites_file()
-    await ctx.respond(f"Here is your invite: {invite.url}")
-    print("New Invite Created")
+async def db_setup():
+    async with aiosqlite.connect('invite_tracker.db') as db:
+        await db.execute('''CREATE TABLE IF NOT EXISTS users (
+                            user_id INTEGER PRIMARY KEY,
+                            invite_code TEXT,
+                            score INTEGER DEFAULT 0,
+                            invited_code TEXT
+                        );''')
+        await db.commit()
 
-# Returns Your Existing Invite
-@bot.command(description="Responds with your invite.")
-async def myinvite(ctx):
-    author_id = str(ctx.author.id)
-    if author_id in invites:
-        await ctx.respond(f"Your invite: {invites[author_id]['url']} has {invites[author_id]['uses']} uses.")
-    else:
-        await ctx.respond("You don't have an invite.")
+@bot.event
+async def on_ready():
+    print(f'{bot.user.name} has connected to Discord!')
+    await db_setup()
+    global invites_before
+    for guild in bot.guilds:
+        members = await guild.fetch_members(limit=None).flatten()
+        async with aiosqlite.connect('invite_tracker.db') as db:
+            for member in members:
+                await db.execute('''INSERT OR IGNORE INTO users (user_id) VALUES (?)''', (member.id,))
+            await db.commit()
+        # Populate invites_before for each guild on bot startup
+        invites_before[guild.id] = {invite.code: invite.uses for invite in await guild.invites()}
 
-# Load Invites
-def loadinvites():
-    global invites
-    invites = {}
+@bot.slash_command(name='createinvite', description='Create or retrieve your personal invite link')
+async def create_invite(interaction: discord.Interaction):
+    async with aiosqlite.connect('invite_tracker.db') as db:
+        cursor = await db.execute('SELECT invite_code FROM users WHERE user_id = ?', (interaction.user.id,))
+        invite_code = await cursor.fetchone()
+        if invite_code and invite_code[0]:
+            await interaction.response.send_message(f'Your invite link: https://discord.gg/{invite_code[0]}', ephemeral=True)
+        else:
+            # Adjusted to handle the case where the system_channel might be None
+            channel = interaction.guild.text_channels[0] if interaction.guild.system_channel is None else interaction.guild.system_channel
+            invite = await channel.create_invite(max_age=86400, unique=True)
+            await db.execute('UPDATE users SET invite_code = ? WHERE user_id = ?', (invite.code, interaction.user.id))
+            await db.commit()
+            await interaction.response.send_message(f'Your invite link: {invite.url}', ephemeral=True)
 
-    try:
-        with open("invites.txt") as f:
-            for line in f:
-                data = line.strip().split(";")
-                author_id, invite_url, uses, *users = data
-                invites[author_id] = {"url": invite_url, "uses": int(uses), "users": [int(user) for user in users]}
-    except FileNotFoundError:
-        pass
-    print("Loaded Invites")
+@bot.slash_command(name='invitebalance', description='Display how many points a particular user has based on joins')
+@commands.has_permissions(administrator=True)
+async def invite_balance(interaction: discord.Interaction, member: discord.Member):
+    async with aiosqlite.connect('invite_tracker.db') as db:
+        cursor = await db.execute('SELECT score FROM users WHERE user_id = ?', (member.id,))
+        score = await cursor.fetchone()
+        if score:
+            await interaction.response.send_message(f'{member.display_name} has {score[0]} points.', ephemeral=True)
+        else:
+            await interaction.response.send_message(f'{member.display_name} has 0 points.', ephemeral=True)
 
-# Update Invites
-def update_invites_file():
-    with open("invites.txt", "w") as f:
-        for author_id, invite_data in invites.items():
-            f.write(f"{author_id};{invite_data['url']};{invite_data['uses']};{';'.join(map(str, invite_data['users']))}1\n")
+@bot.slash_command(name='leaderboard', description='Display only users that have a balance of >0 and list them highest to lowest')
+@commands.has_permissions(administrator=True)
+async def leaderboard(interaction: discord.Interaction):
+    leaderboard_message = "Invite Leaderboard:\n"
+    async with aiosqlite.connect('invite_tracker.db') as db:
+        cursor = await db.execute('SELECT user_id, score FROM users WHERE score > 0 ORDER BY score DESC')
+        leaderboard = await cursor.fetchall()
+        for rank, (user_id, score) in enumerate(leaderboard, start=1):
+            user = await bot.fetch_user(user_id)
+            leaderboard_message += f"{rank}. {user.display_name} - {score} Points\n"
+    await interaction.response.send_message(leaderboard_message, ephemeral=True)
 
-# On Join
+@bot.slash_command(name='inviter', description='Displays who invited the person to the server')
+@commands.has_permissions(administrator=True)
+async def inviter(interaction: discord.Interaction, member: discord.Member):
+    async with aiosqlite.connect('invite_tracker.db') as db:
+        # Fetch the invite code used by the member
+        cursor = await db.execute('SELECT invited_code FROM users WHERE user_id = ?', (member.id,))
+        invited_code = await cursor.fetchone()
+        
+        if invited_code and invited_code[0]:
+            # Fetch the user who created the invite
+            cursor = await db.execute('SELECT user_id FROM users WHERE invite_code = ?', (invited_code[0],))
+            inviter_id = await cursor.fetchone()
+            
+            if inviter_id:
+                inviter_user = await bot.fetch_user(inviter_id[0])
+                await interaction.response.send_message(f'{member.display_name} was invited by {inviter_user.display_name}', ephemeral=True)
+            else:
+                await interaction.response.send_message("Inviter information not found.", ephemeral=True)
+        else:
+            await interaction.response.send_message("No invite information found for this user.", ephemeral=True)
+
 @bot.event
 async def on_member_join(member):
-    print("member joined")
-    guild = member.guild
-    invite = None
-    invite_list = await guild.invites()
-    most_recent = None
-    max_timestamp = 0
-    for inv in invite_list:
-        if inv.uses > 0 and inv.created_at.timestamp() > max_timestamp:
-            max_timestamp = inv.created_at.timestamp()
-            most_recent = inv
-    if most_recent:
-        for author_id, invite_data in invites.items():
-            if invite_data['url'] == most_recent.url:
-                invites[author_id]["uses"] += 1
-                invites[author_id]["users"].append(member.id)
-                invited_by = guild.get_member(author_id)
-                invites_amount = invite_data["uses"]
-                break
-    else:
-        invited_by = None
-        invites_amount = None
-    update_invites_file()
-    channel = bot.get_channel(1070649769707458590) # This Channel ID Can Be Changed To Any
-    await channel.send(f"{member.mention} joined the server.")
+    global invites_before
+    guild_id = member.guild.id
 
-# Gets The Inviter Of A User If They Joined From A Bot Invite
-@bot.command(description="Responds with the inviter of the mentioned user.")
-async def inviter(ctx, member: discord.Member):
-    author_id = None
-    for invite_author_id, invite_data in invites.items():
-        if member.id in invite_data["users"]:
-            author_id = invite_author_id
+    if guild_id not in invites_before:
+        invites_before[guild_id] = {invite.code: invite.uses for invite in await member.guild.invites()}
+    
+    invites_after = await member.guild.invites()
+    used_invite = None
+
+    for invite in invites_after:
+        before_uses = invites_before[guild_id].get(invite.code, 0)
+        if invite.uses > before_uses:
+            used_invite = invite
             break
-    if author_id is None:
-        await ctx.respond("Could not find the inviter.")
-    else:
-        inviter = ctx.guild.get_member(int(author_id))
-        await ctx.respond(f"{member.mention} was invited by {inviter.mention}")
 
+    if used_invite:
+        async with aiosqlite.connect('invite_tracker.db') as db:
+            # Update the inviter's score
+            await db.execute('''UPDATE users SET score = score + 1 
+                                WHERE invite_code = ?''', (used_invite.code,))
+            # Record the invite code used by the new member
+            await db.execute('''UPDATE users SET invited_code = ? 
+                                WHERE user_id = ?''', (used_invite.code, member.id))
+            await db.commit()
 
+    invites_before[guild_id] = {invite.code: invite.uses for invite in invites_after}
 
-
-
-
-# Add Referral Amount
-@bot.command(description="Add an amount referred to the mentioned user.")
-async def referraladd(ctx, member: discord.Member, amount: int):
-    if not ctx.author.guild_permissions.manage_guild:
-        await ctx.respond("You do not have permission to use this command.")
-        return
-    member_id = str(member.id)
-    if member_id not in referralamounts:
-        referralamounts[member_id] = 0
-    referralamounts[member_id] += amount
-    updatereferral()
-    await ctx.respond(f"${amount} has been added to {member.mention}'s referral amount.")
-
-# Check Referral Amount
-@bot.command(description="Responds with the referral amount of the mentioned user or the author if no user is specified.")
-async def referralamount(ctx, member: discord.Member = None):
-    if member is None:
-        member = ctx.author
-    member_id = str(member.id)
-    if member_id not in referralamounts:
-        referralamounts[member_id] = 0
-    await ctx.respond(f"{member.mention} has referred a total of ${referralamounts[member_id]}")
-
-# Quickly Add Referral Amount
-@bot.command(description="Add a referral amount to the inviter of the mentioned user.")
-async def quickreferraladd(ctx, member: discord.Member, amount: int):
-    if not ctx.author.guild_permissions.manage_guild:
-        await ctx.respond("You do not have permission to use this command.")
-        return
-    member_id = str(member.id)
-    inviter = None
-    for invite_author_id, invite_data in invites.items():
-        if member.id in invite_data["users"]:
-            inviter = ctx.guild.get_member(int(invite_author_id))
-            break
-    if inviter is None:
-        await ctx.respond("Could not find the inviter or the invite was not created through the bot.")
-        return
-    inviter_id = str(inviter.id)
-    if inviter_id not in referralamounts:
-        referralamounts[inviter_id] = 0
-    referralamounts[inviter_id] += amount
-    updatereferral()
-    await ctx.respond(f"${amount} has been added to {inviter.mention}'s referral amount.")
-
-# Function To Update Referral File
-def updatereferral():
-    with open("referralamounts.txt", "w") as f:
-        for member_id, amount in referralamounts.items():
-            f.write(f"{member_id};{amount}\n")
-
-# Function To Load Referral File
-def loadreferral():
-    global referralamounts
-    referralamounts = {}
-    try:
-        with open("referralamounts.txt") as f:
-            for line in f:
-                data = line.strip().split(";")
-                member_id, amount = data
-                referralamounts[member_id] = int(amount)
-    except FileNotFoundError:
-        pass
-    print("Loaded Referral Amounts")
-
-# Initialise Bot
-loadreferral()
-loadinvites()
-bot.run("TOKEN")
+bot.run(TOKEN) # Make sure to set this properly in your environment
